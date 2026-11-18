@@ -4,19 +4,158 @@
     GUI for SEP-Check.ps1: DNS health + Symantec Endpoint Protection (SEP) trace detection.
 
 .DESCRIPTION
-    Uses the functions in SEP-Check.ps1, which must be in the same folder.
-    Scans run in the background so the window stays responsive.
+    Standalone: does not need SEP-Check.ps1. Scans run in the background so the window stays responsive.
     Run with Windows PowerShell:  powershell.exe -ExecutionPolicy Bypass -File .\SEP-Check-GUI.ps1
 #>
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing, Microsoft.VisualBasic
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-$CorePath = Join-Path $PSScriptRoot 'SEP-Check.ps1'
-if (-not (Test-Path -LiteralPath $CorePath)) {
-    [void][System.Windows.Forms.MessageBox]::Show("SEP-Check.ps1 was not found in:`n$PSScriptRoot", 'SEP Check', 'OK', 'Error')
-    return
+# ---------------- Scan logic ----------------
+# Same logic as SEP-Check.ps1, embedded so this GUI runs on its own (no other file needed).
+$Core = {
+    # Matches Symantec / SEP names and known SEP service/driver names.
+    $SepPattern = '(?i)symantec|(?<![a-z])sepm?(?![a-z])|sepmasterservice|smcservice|ccsvchst|srtsp|symevent|symelam|symefa|symiron|bhdrv|idsvi|eectrl|sysplant'
+
+    # Runs ON the target machine. Kept PowerShell 2.0 compatible for old endpoints.
+    $SepScanBlock = {
+        param([string]$Pattern)
+
+        $folders = @(@(
+            foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData)) {
+                if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
+                Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue |
+                    Where-Object { $_.PSIsContainer } | ForEach-Object {
+                        if ($_.Name -match $Pattern) { $_.FullName }
+                        Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue |
+                            Where-Object { $_.PSIsContainer -and $_.Name -match $Pattern } |
+                            ForEach-Object { $_.FullName }
+                    }
+            }
+        ) | Sort-Object -Unique)
+
+        $reg = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($key in 'HKLM:\SOFTWARE\Symantec', 'HKLM:\SOFTWARE\WOW6432Node\Symantec') {
+            if (Test-Path $key) {
+                $reg.Add($key)
+                Get-ChildItem $key -ErrorAction SilentlyContinue |
+                    ForEach-Object { $reg.Add(($_.Name -replace '^HKEY_LOCAL_MACHINE', 'HKLM:')) }
+            }
+        }
+        Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+            Where-Object { "$($_.DisplayName) $($_.Publisher)" -match $Pattern } |
+            ForEach-Object { $reg.Add("Uninstall: $($_.DisplayName) $($_.DisplayVersion) [$($_.PSChildName)]") }
+        Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\*' -ErrorAction SilentlyContinue |
+            Where-Object { "$($_.PSChildName) $($_.DisplayName) $($_.ImagePath)" -match $Pattern } |
+            ForEach-Object { $reg.Add("Service: $($_.PSChildName)") }
+
+        New-Object PSObject -Property @{ Folders = @($folders); Registry = @($reg) }
+    }
+
+    function Resolve-Target([string]$Name) {
+        $n = "$Name".Trim()
+        if ($n -in 'localhost', '.', '127.0.0.1', '::1') { return $env:COMPUTERNAME }
+        $n
+    }
+
+    # Accepts names separated by new lines, commas, semicolons, spaces or tabs.
+    function ConvertTo-ComputerList([string[]]$Text) {
+        @($Text -split '[\s,;]+' |
+            Where-Object { $_ } |
+            ForEach-Object { Resolve-Target $_ } |
+            Sort-Object -Unique)
+    }
+
+    function Test-Ping([string]$Address) {
+        $ping = New-Object System.Net.NetworkInformation.Ping
+        try {
+            foreach ($i in 1..2) {
+                try { if ($ping.Send($Address, 1000).Status -eq 'Success') { return $true } } catch { }
+            }
+            $false
+        } finally { $ping.Dispose() }
+    }
+
+    function Test-DnsHealth([string]$Name) {
+        $r = [ordered]@{ IPAddress = ''; Ping = 'Fail'; ReverseName = ''; DnsStatus = '' }
+
+        try { $a = @(Resolve-DnsName -Name $Name -Type A -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'A' }) }
+        catch { $a = @() }
+        if (-not $a) {
+            $r.DnsStatus = 'FAIL: no A record (forward lookup failed)'
+            return [pscustomobject]$r
+        }
+
+        $ip = $a[0].IPAddress
+        $r.IPAddress = $ip
+        if (Test-Ping $ip) { $r.Ping = 'OK' }
+
+        try { $ptr = Resolve-DnsName -Name $ip -Type PTR -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'PTR' } | Select-Object -First 1 -ExpandProperty NameHost }
+        catch { $ptr = $null }
+        $r.ReverseName = "$ptr"
+
+        $r.DnsStatus = if (-not $ptr) { "FAIL: no PTR record for $ip (reverse lookup failed)" }
+            elseif (($ptr -split '\.')[0] -ne ($Name -split '\.')[0]) { "FAIL: PTR mismatch, $ip resolves to $ptr" }
+            elseif ($a.Count -gt 1) { "WARN: multiple A records ($(($a | ForEach-Object { $_.IPAddress }) -join ', '))" }
+            else { 'OK' }
+        [pscustomobject]$r
+    }
+
+    # Scans the given machines once. Returns one result row per machine.
+    function Invoke-SepScan([string[]]$ComputerName, [int]$Cycle = 1) {
+        $rows = foreach ($c in $ComputerName) {
+            $dns = Test-DnsHealth $c
+            [pscustomobject]@{
+                Computer     = $c
+                Status       = ''
+                DnsStatus    = $dns.DnsStatus
+                IPAddress    = $dns.IPAddress
+                Ping         = $dns.Ping
+                ReverseName  = $dns.ReverseName
+                SepDetected  = 'Unknown'
+                FolderHits   = ''
+                RegistryHits = ''
+                Error        = ''
+                Cycle        = $Cycle
+                ScanTime     = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            }
+        }
+
+        $results = @{}
+        $remoteErrors = @()
+        $local = $rows | Where-Object { $_.Computer -eq $env:COMPUTERNAME }
+        if ($local) { $results[$local.Computer] = & $SepScanBlock $SepPattern }
+
+        $remote = @($rows | Where-Object { $_.IPAddress -and $_.Computer -ne $env:COMPUTERNAME } | ForEach-Object { $_.Computer })
+        if ($remote) {
+            $opt = New-PSSessionOption -OpenTimeout 15000 -OperationTimeout 300000
+            try {
+                Invoke-Command -ComputerName $remote -ScriptBlock $SepScanBlock -ArgumentList $SepPattern `
+                    -SessionOption $opt -ErrorAction SilentlyContinue -ErrorVariable remoteErrors |
+                    ForEach-Object { $results[$_.PSComputerName] = $_ }
+            } catch { $remoteErrors += $_ }
+        }
+
+        foreach ($r in $rows) {
+            $res = $results[$r.Computer]
+            if ($res) {
+                $r.Status       = 'Scanned'
+                $r.FolderHits   = @($res.Folders) -join '; '
+                $r.RegistryHits = @($res.Registry) -join '; '
+                $r.SepDetected  = if ($r.FolderHits -or $r.RegistryHits) { 'Yes' } else { 'No' }
+            }
+            elseif (-not $r.IPAddress) { $r.Status = 'NotResolved' }
+            elseif ($r.Ping -ne 'OK')  { $r.Status = 'Offline' }
+            else {
+                $r.Status = 'RemoteError'
+                $msg = $remoteErrors | Where-Object { "$_" -like "*$($r.Computer)*" } | Select-Object -First 1
+                $r.Error = if ($msg) { "$msg".Trim() } else { 'Remote query failed (check WinRM / admin rights)' }
+            }
+        }
+        $rows
+    }
 }
-. $CorePath   # loads Resolve-Target, Read-ComputerList, Invoke-SepScan
+. $Core
 
 # ---------------- Accenture palette ----------------
 function Hex([string]$h) { [System.Drawing.ColorTranslator]::FromHtml($h) }
@@ -79,9 +218,10 @@ $top.Dock = 'Top'; $top.Height = 92; $top.BackColor = $PalePurp
 $rbSingle  = New-Control RadioButton 'Single machine' 16 16 140
 $rbSingle.Checked = $true
 $txtSingle = New-Control TextBox $env:COMPUTERNAME 160 16 260
-$rbList    = New-Control RadioButton 'Machine list (.txt)' 16 52 140
-$txtList   = New-Control TextBox '' 160 52 260
-$btnBrowse = New-Button 'Browse...' 428 49 90
+$rbList    = New-Control RadioButton 'Multiple machines' 16 52 140
+$btnList   = New-Button 'Enter machines...' 160 49 160
+$lblCount  = New-Control Label 'No machines entered' 330 55 200
+$lblCount.ForeColor = $Gray
 
 $lblCycles   = New-Control Label 'Cycles' 548 19 90
 $nudCycles   = New-Control NumericUpDown '' 640 16 70
@@ -96,7 +236,7 @@ $btnStop.Enabled = $false
 $btnExport = New-Button 'Export CSV' 740 49 230
 $btnExport.BackColor = $DeepPurple
 
-$top.Controls.AddRange(@($rbSingle, $txtSingle, $rbList, $txtList, $btnBrowse,
+$top.Controls.AddRange(@($rbSingle, $txtSingle, $rbList, $btnList, $lblCount,
     $lblCycles, $nudCycles, $lblInterval, $nudInterval, $btnStart, $btnStop, $btnExport))
 
 $grid = New-Object System.Windows.Forms.DataGridView
@@ -138,6 +278,7 @@ $script:Pending = @()        # machines not scanned yet
 $script:CyclesLeft = 0
 $script:CycleNo = 0
 $script:NextRun = $null
+$script:DeviceText = ''      # text typed/pasted in the machine list window
 
 function Set-Status([string]$Text) { $statusLabel.Text = $Text }
 
@@ -156,16 +297,46 @@ function Update-Grid($Rows) {
     }
 }
 
+function Show-DeviceListDialog([string]$Text) {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'Machine list'
+    $dlg.ClientSize = New-Object System.Drawing.Size(420, 450)
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.BackColor = $White
+    $dlg.Font = $Font
+
+    $lbl = New-Control Label 'Type or paste the machine names (one per line, or separated by comma / space):' 12 10 396 34
+    $txt = New-Control TextBox $Text 12 48 396 340
+    $txt.Multiline = $true
+    $txt.AcceptsReturn = $true
+    $txt.ScrollBars = 'Vertical'
+    $txt.Font = New-Object System.Drawing.Font('Consolas', 10)
+    $ok = New-Button 'OK' 188 402 100
+    $ok.DialogResult = 'OK'
+    $cancel = New-Button 'Cancel' 298 402 110
+    $cancel.DialogResult = 'Cancel'
+    $cancel.BackColor = $DeepPurple
+    $dlg.CancelButton = $cancel
+    $dlg.Controls.AddRange(@($lbl, $txt, $ok, $cancel))
+
+    $result = if ($dlg.ShowDialog($form) -eq 'OK') { $txt.Text } else { $null }
+    $dlg.Dispose()
+    $result
+}
+
 function Start-Cycle {
     $script:CycleNo++
     $script:CyclesLeft--
     Set-Status ("Cycle {0}: scanning {1} machine(s)..." -f $script:CycleNo, $script:Pending.Count)
     $ps = [PowerShell]::Create()
     [void]$ps.AddScript({
-        param($Core, $Targets, $Cycle)
-        . $Core
+        param($CoreText, $Targets, $Cycle)
+        . ([scriptblock]::Create($CoreText))
         Invoke-SepScan -ComputerName $Targets -Cycle $Cycle
-    }).AddArgument($CorePath).AddArgument($script:Pending).AddArgument($script:CycleNo)
+    }).AddArgument($Core.ToString()).AddArgument($script:Pending).AddArgument($script:CycleNo)
     $script:Job = @{ PS = $ps; Handle = $ps.BeginInvoke() }
 }
 
@@ -221,20 +392,17 @@ $timer.Add_Tick({
     }
 })
 
-$btnBrowse.Add_Click({
-    $dlg = New-Object System.Windows.Forms.OpenFileDialog
-    $dlg.Filter = 'Text files (*.txt)|*.txt|All files (*.*)|*.*'
-    if ($dlg.ShowDialog() -eq 'OK') { $txtList.Text = $dlg.FileName; $rbList.Checked = $true }
+$btnList.Add_Click({
+    $text = Show-DeviceListDialog $script:DeviceText
+    if ($null -eq $text) { return }
+    $script:DeviceText = $text
+    $count = @(ConvertTo-ComputerList $text).Count
+    $lblCount.Text = if ($count) { "$count machine(s) entered" } else { 'No machines entered' }
+    $rbList.Checked = $true
 })
 
 $btnStart.Add_Click({
-    try {
-        $targets = if ($rbList.Checked) { Read-ComputerList $txtList.Text } else { @(Resolve-Target $txtSingle.Text) }
-    } catch {
-        [void][System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'SEP Check', 'OK', 'Warning')
-        return
-    }
-    $targets = @($targets | Where-Object { $_ })
+    $targets = if ($rbList.Checked) { ConvertTo-ComputerList $script:DeviceText } else { ConvertTo-ComputerList $txtSingle.Text }
     if (-not $targets) {
         [void][System.Windows.Forms.MessageBox]::Show('No machines to scan.', 'SEP Check', 'OK', 'Warning')
         return
