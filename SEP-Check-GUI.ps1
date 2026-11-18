@@ -79,24 +79,26 @@ $Core = {
     function Test-DnsHealth([string]$Name) {
         $r = [ordered]@{ IPAddress = ''; Ping = 'Fail'; ReverseName = ''; DnsStatus = '' }
 
-        try { $a = @(Resolve-DnsName -Name $Name -Type A -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'A' }) }
-        catch { $a = @() }
-        if (-not $a) {
-            $r.DnsStatus = 'FAIL: no A record (forward lookup failed)'
+        # Forward lookup with the Windows resolver, same as "ping <name>" (applies the DNS suffix list).
+        try { $ips = @([System.Net.Dns]::GetHostAddresses($Name) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.IPAddressToString }) }
+        catch { $ips = @() }
+        if (-not $ips) {
+            $r.DnsStatus = 'FAIL: name does not resolve (forward lookup failed)'
             return [pscustomobject]$r
         }
 
-        $ip = $a[0].IPAddress
+        $ip = $ips[0]
         $r.IPAddress = $ip
         if (Test-Ping $ip) { $r.Ping = 'OK' }
 
-        try { $ptr = Resolve-DnsName -Name $ip -Type PTR -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'PTR' } | Select-Object -First 1 -ExpandProperty NameHost }
-        catch { $ptr = $null }
-        $r.ReverseName = "$ptr"
+        # Reverse lookup, same as "ping -a <ip>".
+        try { $ptr = [System.Net.Dns]::GetHostEntry($ip).HostName } catch { $ptr = '' }
+        if ($ptr -eq $ip) { $ptr = '' }
+        $r.ReverseName = $ptr
 
-        $r.DnsStatus = if (-not $ptr) { "FAIL: no PTR record for $ip (reverse lookup failed)" }
-            elseif (($ptr -split '\.')[0] -ne ($Name -split '\.')[0]) { "FAIL: PTR mismatch, $ip resolves to $ptr" }
-            elseif ($a.Count -gt 1) { "WARN: multiple A records ($(($a | ForEach-Object { $_.IPAddress }) -join ', '))" }
+        $r.DnsStatus = if (-not $ptr) { "FAIL: no reverse record for $ip (reverse lookup failed)" }
+            elseif (($ptr -split '\.')[0] -ne ($Name -split '\.')[0]) { "FAIL: reverse mismatch, $ip resolves to $ptr" }
+            elseif ($ips.Count -gt 1) { "WARN: name resolves to multiple IPs ($($ips -join ', '))" }
             else { 'OK' }
         [pscustomobject]$r
     }
