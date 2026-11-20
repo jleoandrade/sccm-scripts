@@ -277,6 +277,8 @@ elseif ($action -eq 'Uninstall') {
         return
     }
     $exe = $sp.Exe; $procArgs = $sp.Args
+    # Quiet uninstaller: always ask for no restart (unless the command already has the switch)
+    if ($mode -eq 'EXE (quiet)' -and $procArgs -notmatch '(?i)[/-]-?no-?restart') { $procArgs = "$procArgs /norestart".Trim() }
 }
 else {
     # Repair of a non-MSI program: only through its own modify/repair screen, on the computer itself
@@ -987,7 +989,7 @@ function Invoke-EntryAction([string]$Action) {
         $names = @($p.Entries | Select-Object -First 12 | ForEach-Object { "- $($_.Name) $($_.Version)" })
         $msg = "$($p.Action.ToUpper()) $($p.Entries.Count) program(s) on $($g.Computer), one at a time:`n`n" + ($names -join "`n")
         if ($p.Entries.Count -gt 12) { $msg += "`n... and $($p.Entries.Count - 12) more" }
-        $msg += "`n`nMSI programs run silently with /norestart. Others use their own uninstaller/repair (interactive ones show a screen on this computer). This tool never forces a restart, but some uninstallers can ask for one."
+        $msg += "`n`nMSI programs and quiet uninstallers run silently with /norestart. Others use their own uninstaller/repair (interactive ones show a screen on this computer). This tool never forces a restart, but some uninstallers can ask for one."
         if (-not $g.InWindow) { $msg += "`n`nWARNING: outside the maintenance window ($WindowStartHour`:00-$WindowEndHour`:00)." }
         if ($p.Action -eq 'Uninstall') { $msg += "`n`nAfterwards I will scan for leftovers and ask before deleting anything." }
         $msg += "`n`nContinue?"
