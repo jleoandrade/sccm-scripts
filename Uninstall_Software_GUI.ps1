@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    GUI tool (Accenture palette) to list installed software, uninstall or repair it, and scan for leftovers.
+    GUI tool to list installed software, uninstall or repair it, and scan for leftovers.
 
 .DESCRIPTION
     Works on the local computer or on a remote one (WinRM). Every action asks for confirmation first.
@@ -240,7 +240,11 @@ function Get-Inventory {
 function New-Body([string]$Body) { [scriptblock]::Create("param(`$Arg)`n" + $Common + "`n" + $Body) }
 
 $GuardBody = New-Body @'
-Out-Result (Get-GuardState $Arg)
+$g = Get-GuardState $Arg
+# Between queue items: wait for a lingering msiexec/TiWorker to finish (never when a reboot is pending)
+$waited = 0
+while ($g.Busy -and -not $g.RebootPending -and $waited -lt [int]$Arg.WaitBusySeconds) { Start-Sleep -Seconds 10; $waited += 10; $g = Get-GuardState $Arg }
+Out-Result $g
 '@
 
 $InventoryBody = New-Body @'
@@ -704,7 +708,7 @@ $grid.Dock = 'Fill'
 $grid.DataSource = $view
 $grid.ReadOnly = $true
 $grid.AllowUserToAddRows = $false; $grid.AllowUserToDeleteRows = $false; $grid.AllowUserToResizeRows = $false
-$grid.SelectionMode = 'FullRowSelect'; $grid.MultiSelect = $false
+$grid.SelectionMode = 'FullRowSelect'; $grid.MultiSelect = $true
 $grid.RowHeadersVisible = $false
 $grid.BackgroundColor = $White; $grid.BorderStyle = 'None'
 $grid.GridColor = $Concrete; $grid.CellBorderStyle = 'SingleHorizontal'
@@ -750,7 +754,7 @@ $lblSelected = New-Object System.Windows.Forms.Label
 $lblSelected.Location = New-Object System.Drawing.Point(356, 11); $lblSelected.Size = New-Object System.Drawing.Size(780, 34)
 $lblSelected.TextAlign = 'MiddleLeft'; $lblSelected.ForeColor = $Gray
 $lblSelected.Anchor = 'Top, Left, Right'
-$lblSelected.Text = 'Select a program in the list.'
+$lblSelected.Text = 'Select one or more programs (Ctrl/Shift + click).'
 $pnlActions.Controls.AddRange(@($btnUninstall, $btnRepair, $lblSelected))
 
 # Toolbar: computer + load + filter
@@ -879,24 +883,28 @@ function Update-Banner($Guard) {
 
 function Get-ArgBase { return @{ WindowStartHour = $WindowStartHour; WindowEndHour = $WindowEndHour; MinFreeGB = $MinFreeGB } }
 
-function Get-SelectedEntry {
-    if ($grid.SelectedRows.Count -eq 0) { return $null }
-    $id = [int]$grid.SelectedRows[0].Cells['Id'].Value
-    return $script:Entries[$id]
+function Get-SelectedEntries {
+    $list = @()
+    foreach ($row in $grid.SelectedRows) { $list += $script:Entries[[int]$row.Cells['Id'].Value] }
+    return @($list | Sort-Object Name)
 }
 
 function Update-SelectionState {
-    $e = Get-SelectedEntry
-    if (-not $e) {
+    $sel = @(Get-SelectedEntries)
+    if (-not $sel.Count) {
         Set-ButtonEnabled $btnUninstall $false; Set-ButtonEnabled $btnRepair $false
-        $lblSelected.Text = 'Select a program in the list.'
+        $lblSelected.Text = 'Select one or more programs (Ctrl/Shift + click).'
         return
     }
-    $canUninstall = [bool]($e.UninstallString -or $e.QuietUninstallString)
-    $canRepair = [bool](($e.IsMsi -and $e.ProductCode) -or ($e.ModifyPath -and -not $e.NoRepair))
+    $canUninstall = $true; $canRepair = $true
+    foreach ($e in $sel) {
+        if (-not ($e.UninstallString -or $e.QuietUninstallString)) { $canUninstall = $false }
+        if (-not (($e.IsMsi -and $e.ProductCode) -or ($e.ModifyPath -and -not $e.NoRepair))) { $canRepair = $false }
+    }
     Set-ButtonEnabled $btnUninstall ($canUninstall -and -not $script:Busy)
     Set-ButtonEnabled $btnRepair ($canRepair -and -not $script:Busy)
-    $lblSelected.Text = "$($e.Name) $($e.Version)   |   $($e.Publisher)   |   $($e.Scope), $($e.Arch)"
+    if ($sel.Count -eq 1) { $lblSelected.Text = "$($sel[0].Name) $($sel[0].Version)   |   $($sel[0].Publisher)   |   $($sel[0].Scope), $($sel[0].Arch)" }
+    else { $lblSelected.Text = "$($sel.Count) programs selected" }
 }
 
 function Import-Inventory($Items) {
@@ -936,23 +944,33 @@ $txtFilter.Add_TextChanged({
     $lblCount.Text = "$($view.Count) of $($table.Rows.Count) programs"
 })
 
-# --- Uninstall / Repair: guard -> confirmation -> action -> (uninstall) leftover scan ---
-$script:Pending = $null
+# --- Uninstall / Repair of one or more programs: guard -> ONE confirmation -> one program at a time -> leftover scan ---
+$script:Pending = $null      # Action, Interactive, Entries
+$script:Queue = New-Object System.Collections.ArrayList
+$script:Current = $null
+$script:Total = 0
+$script:OkCount = 0
+$script:Done = New-Object System.Collections.ArrayList        # uninstalled programs (to scan)
+$script:Problems = New-Object System.Collections.ArrayList
+$script:RebootNeeded = $false
+$script:ScanQueue = New-Object System.Collections.ArrayList
+$script:ScanItems = New-Object System.Collections.ArrayList
 
 function Invoke-EntryAction([string]$Action) {
-    $e = Get-SelectedEntry
-    if (-not $e) { return }
+    $entries = @(Get-SelectedEntries)
+    if (-not $entries.Count) { return }
     $interactive = Test-IsLocal $txtComputer.Text
-    $hasQuiet = [bool]$e.QuietUninstallString
     if (-not $interactive) {
-        if ($Action -eq 'Uninstall' -and -not ($e.IsMsi -and $e.ProductCode) -and -not $hasQuiet) {
-            [void](Show-Box 'Remote mode only runs silent uninstalls (MSI or quiet uninstaller). This program needs its own screen: run the tool on that computer.' 'Software Manager' 'OK' 'Warning'); return
-        }
-        if ($Action -eq 'Repair' -and -not ($e.IsMsi -and $e.ProductCode)) {
-            [void](Show-Box 'Remote repair is only available for MSI programs.' 'Software Manager' 'OK' 'Warning'); return
+        $bad = @($entries | Where-Object {
+            $msi = ($_.IsMsi -and $_.ProductCode)
+            if ($Action -eq 'Uninstall') { -not $msi -and -not $_.QuietUninstallString } else { -not $msi }
+        })
+        if ($bad.Count) {
+            [void](Show-Box ("Remote mode only runs silent actions (MSI, or a quiet uninstaller). Not possible for:`n- " + (($bad | ForEach-Object { $_.Name }) -join "`n- ") + "`n`nUnselect them or run the tool on that computer.") 'Software Manager' 'OK' 'Warning')
+            return
         }
     }
-    $script:Pending = @{ Action = $Action; Entry = $e; Interactive = $interactive }
+    $script:Pending = @{ Action = $Action; Interactive = $interactive; Entries = $entries }
     Start-Op "Checking the computer state before $Action" $GuardBody (Get-ArgBase) {
         param($g, $r)
         if (-not $g) { [void](Show-Box "Could not check the computer state. Nothing was changed.`n$r" 'Software Manager' 'OK' 'Error'); return }
@@ -966,46 +984,110 @@ function Invoke-EntryAction([string]$Action) {
             [void](Show-Box ("Blocked by the safety rules. Nothing was changed.`n`n" + ($blockers -join "`n") + "`n`nRestart the computer / wait, then try again. This tool never restarts the computer.") 'Blocked' 'OK' 'Warning')
             return
         }
-        $e = $p.Entry
-        if ($e.IsMsi -and $e.ProductCode) { $how = 'Windows Installer, no restart forced (/norestart)' }
-        elseif ($p.Action -eq 'Repair') { $how = "the program's own repair screen" }
-        elseif ($e.QuietUninstallString) { $how = 'its quiet uninstaller' }
-        else { $how = "its own uninstaller screen (you will interact with it)" }
-        $msg = "$($p.Action.ToUpper()) on $($g.Computer):`n`n$($e.Name) $($e.Version)`n$($e.Publisher)`n`nMethod: $how.`nThis tool never forces a restart, but some uninstallers can ask for one."
+        $names = @($p.Entries | Select-Object -First 12 | ForEach-Object { "- $($_.Name) $($_.Version)" })
+        $msg = "$($p.Action.ToUpper()) $($p.Entries.Count) program(s) on $($g.Computer), one at a time:`n`n" + ($names -join "`n")
+        if ($p.Entries.Count -gt 12) { $msg += "`n... and $($p.Entries.Count - 12) more" }
+        $msg += "`n`nMSI programs run silently with /norestart. Others use their own uninstaller/repair (interactive ones show a screen on this computer). This tool never forces a restart, but some uninstallers can ask for one."
         if (-not $g.InWindow) { $msg += "`n`nWARNING: outside the maintenance window ($WindowStartHour`:00-$WindowEndHour`:00)." }
         if ($p.Action -eq 'Uninstall') { $msg += "`n`nAfterwards I will scan for leftovers and ask before deleting anything." }
         $msg += "`n`nContinue?"
         if ((Show-Box $msg "Confirm $($p.Action)" 'YesNo' 'Question') -ne 'Yes') { Add-LogLine 'Cancelled by the user. Nothing was changed.'; return }
-        $arg = Get-ArgBase
-        $arg.Action = $p.Action; $arg.Entry = $e; $arg.Interactive = $p.Interactive
-        Start-Op "$($p.Action) $($e.Name)" $ActionBody $arg { param($res, $rr) Complete-Action $res $rr }
+        $script:Queue = New-Object System.Collections.ArrayList
+        foreach ($x in $p.Entries) { [void]$script:Queue.Add($x) }
+        $script:Total = $script:Queue.Count
+        $script:OkCount = 0; $script:RebootNeeded = $false
+        $script:Done = New-Object System.Collections.ArrayList
+        $script:Problems = New-Object System.Collections.ArrayList
+        Start-NextAction
     }
 }
 
-function Complete-Action($res, $reason) {
+function Start-NextAction {
     $p = $script:Pending
-    if (-not $res) { [void](Show-Box "No answer from the target.`n$reason`nCheck the log; the program may or may not have been changed." 'Software Manager' 'OK' 'Error'); Start-Load; return }
-    if ($res.Guard) { Update-Banner $res.Guard }
-    $success = [bool]$res.Ok
-    if ($p.Action -eq 'Uninstall' -and $res.EntryGone) { $success = $true }
-    if (-not $success) {
-        Add-LogLine "$($p.Action) failed: $($res.Message)"
-        [void](Show-Box "$($p.Action) did not complete: $($res.Message)" 'Software Manager' 'OK' 'Warning')
-        Start-Load; return
-    }
-    Add-LogLine "$($p.Action) finished: $($res.Message)"
-    if ($res.RebootRequired -or ($res.Guard -and $res.Guard.RebootPending)) {
-        [void](Show-Box 'A restart is now pending. This tool does NOT restart the computer. Deleting leftovers stays blocked until the computer is restarted; the scan below is read-only and you can save its list.' 'Restart pending' 'OK' 'Warning')
-    }
-    if ($p.Action -eq 'Repair') {
-        [void](Show-Box "Repair completed: $($res.Message)" 'Software Manager' 'OK' 'Information'); Start-Load; return
-    }
-    if (-not $res.EntryGone) {
-        [void](Show-Box 'The uninstaller finished but the program is still listed. The leftover scan was skipped so a working installation is not damaged.' 'Software Manager' 'OK' 'Warning'); Start-Load; return
-    }
+    if ($script:Queue.Count -eq 0) { Complete-Queue; return }
+    $e = $script:Queue[0]; $script:Queue.RemoveAt(0)
+    $script:Current = $e
     $arg = Get-ArgBase
-    $arg.Entry = $p.Entry
-    Start-Op "Scanning leftovers of $($p.Entry.Name)" $ScanBody $arg { param($s, $sr) Complete-Scan $s $sr }
+    $arg.Action = $p.Action; $arg.Entry = $e; $arg.Interactive = $p.Interactive
+    $n = $script:Total - $script:Queue.Count
+    Start-Op "$($p.Action) $($e.Name) ($n of $($script:Total))" $ActionBody $arg { param($res, $rr) Complete-Action $res $rr }
+}
+
+function Complete-Action($res, $reason) {
+    $p = $script:Pending; $e = $script:Current
+    if (-not $res) {
+        [void]$script:Problems.Add("$($e.Name): no answer from the target ($reason). Queue stopped; check the program state.")
+        $script:Queue.Clear(); Complete-Queue; return
+    }
+    if ($res.Guard) { Update-Banner $res.Guard }
+    if ($res.RebootRequired -or ($res.Guard -and $res.Guard.RebootPending)) { $script:RebootNeeded = $true }
+    if ($p.Action -eq 'Uninstall') {
+        if ($res.EntryGone) { $script:OkCount++; [void]$script:Done.Add($e); Add-LogLine "Uninstalled: $($e.Name) - $($res.Message)" }
+        elseif ($res.Ok) { [void]$script:Problems.Add("$($e.Name): still listed after the uninstaller finished (leftover scan skipped).") }
+        else { [void]$script:Problems.Add("$($e.Name): $($res.Message)") }
+    }
+    else {
+        if ($res.Ok) { $script:OkCount++; Add-LogLine "Repaired: $($e.Name) - $($res.Message)" }
+        else { [void]$script:Problems.Add("$($e.Name): $($res.Message)") }
+    }
+    Complete-Next
+}
+
+# Before each next program: re-check the guards (waits for a lingering msiexec). Stops the queue if blocked.
+function Complete-Next {
+    if ($script:Queue.Count -eq 0) { Complete-Queue; return }
+    $arg = Get-ArgBase
+    $arg.WaitBusySeconds = 300
+    Start-Op 'Checking the computer state before the next program' $GuardBody $arg {
+        param($g, $r)
+        if ($g) { Update-Banner $g }
+        $low = ($script:Pending.Action -eq 'Repair' -and $g -and $g.FreeGB -lt $MinFreeGB)
+        if (-not $g -or $g.RebootPending -or $g.Busy -or $low) {
+            [void]$script:Problems.Add("Queue stopped by the safety rules (reboot pending, install in progress or low disk): $($script:Queue.Count) program(s) not processed.")
+            $script:Queue.Clear(); Complete-Queue; return
+        }
+        Start-NextAction
+    }
+}
+
+function Complete-Queue {
+    $p = $script:Pending
+    $text = "$($script:OkCount) of $($script:Total) program(s) completed."
+    if ($script:RebootNeeded) { $text += "`n`nA restart is now pending. This tool does NOT restart the computer. Deleting leftovers stays blocked until you restart; the scan is read-only and you can save its list." }
+    if ($script:Problems.Count) {
+        $text += "`n`nProblems:`n" + (($script:Problems | Select-Object -First 10) -join "`n")
+        foreach ($pr in $script:Problems) { Add-LogLine "PROBLEM: $pr" }
+    }
+    [void](Show-Box $text 'Software Manager' 'OK' 'Information')
+    if ($p.Action -eq 'Uninstall' -and $script:Done.Count) {
+        $script:ScanQueue = New-Object System.Collections.ArrayList
+        foreach ($x in $script:Done) { [void]$script:ScanQueue.Add($x) }
+        $script:ScanItems = New-Object System.Collections.ArrayList
+        Start-NextScan
+    }
+    else { Start-Load }
+}
+
+# One read-only scan per uninstalled program, merged into a single list
+function Start-NextScan {
+    if ($script:ScanQueue.Count -eq 0) { Review-Leftovers @($script:ScanItems) "$($script:Done.Count) program(s)"; return }
+    $e = $script:ScanQueue[0]; $script:ScanQueue.RemoveAt(0)
+    $arg = Get-ArgBase
+    $arg.Entry = $e
+    Start-Op "Scanning leftovers of $($e.Name)" $ScanBody $arg { param($s, $sr) Collect-Scan $s $sr }
+}
+
+function Collect-Scan($s, $reason) {
+    if (-not $s) { Add-LogLine "Leftover scan failed: $reason" }
+    else {
+        foreach ($n in @($s.Notes)) { Add-LogLine $n }
+        foreach ($it in @($s.Items)) {
+            $dup = $false
+            foreach ($x in $script:ScanItems) { if ($x.Kind -eq $it.Kind -and $x.Path -eq $it.Path -and $x.Extra -eq $it.Extra) { $dup = $true } }
+            if (-not $dup) { $it | Add-Member -NotePropertyName Program -NotePropertyValue $s.Name -Force; [void]$script:ScanItems.Add($it) }
+        }
+    }
+    Start-NextScan
 }
 
 # --- Leftover dialog: nothing is pre-selected ---
@@ -1033,11 +1115,11 @@ function Show-LeftoverDialog($Items, [string]$Name, $Guard) {
     $chk = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
     $chk.HeaderText = 'Delete'; $chk.FillWeight = 7
     [void]$g.Columns.Add($chk)
-    foreach ($c in @(@('Category', 'Type', 22), @('Display', 'Item', 48), @('Detail', 'Detail', 23))) {
+    foreach ($c in @(@('Program', 'Program', 15), @('Category', 'Type', 17), @('Display', 'Item', 40), @('Detail', 'Detail', 21))) {
         $i = $g.Columns.Add($c[0], $c[1]); $g.Columns[$i].FillWeight = $c[2]; $g.Columns[$i].ReadOnly = $true
     }
     foreach ($it in $script:dlgItems) {
-        $idx = $g.Rows.Add($false, [string]$it.Category, [string]$it.Display, [string]$it.Detail)
+        $idx = $g.Rows.Add($false, [string]$it.Program, [string]$it.Category, [string]$it.Display, [string]$it.Detail)
         $g.Rows[$idx].Tag = $it
     }
 
@@ -1082,7 +1164,7 @@ function Show-LeftoverDialog($Items, [string]$Name, $Guard) {
         $sfd = New-Object System.Windows.Forms.SaveFileDialog
         $sfd.Filter = 'CSV (*.csv)|*.csv'; $sfd.FileName = "Leftovers_$(Get-Date -Format 'yyyyMMdd_HHmm').csv"
         if ($sfd.ShowDialog() -eq 'OK') {
-            $script:dlgItems | Select-Object Kind, Category, Display, Path, Extra, Detail | Export-Csv -Path $sfd.FileName -NoTypeInformation -Encoding UTF8
+            $script:dlgItems | Select-Object Program, Kind, Category, Display, Path, Extra, Detail | Export-Csv -Path $sfd.FileName -NoTypeInformation -Encoding UTF8
             Add-LogLine "Leftover list saved to $($sfd.FileName)"
         }
     })
@@ -1100,13 +1182,19 @@ function Show-LeftoverDialog($Items, [string]$Name, $Guard) {
 function Complete-Scan($s, $reason) {
     if (-not $s) { [void](Show-Box "The leftover scan failed.`n$reason" 'Software Manager' 'OK' 'Error'); Start-Load; return }
     foreach ($n in @($s.Notes)) { Add-LogLine $n }
-    $items = @($s.Items)
+    foreach ($it in @($s.Items)) { $it | Add-Member -NotePropertyName Program -NotePropertyValue $s.Name -Force }
+    Review-Leftovers @($s.Items) $s.Name
+}
+
+# Shows the merged leftover list, asks, then deletes what the user ticked
+function Review-Leftovers($Items, [string]$Title) {
+    $items = @($Items)
     if ($items.Count -eq 0) {
         Add-LogLine 'No leftovers found.'
-        [void](Show-Box "No leftovers of '$($s.Name)' were found." 'Software Manager' 'OK' 'Information'); Start-Load; return
+        [void](Show-Box "No leftovers of '$Title' were found." 'Software Manager' 'OK' 'Information'); Start-Load; return
     }
     Add-LogLine "$($items.Count) leftover(s) found."
-    $chosen = @(Show-LeftoverDialog $items $s.Name $script:Guard)
+    $chosen = @(Show-LeftoverDialog $items $Title $script:Guard)
     if (-not $chosen.Count -or -not $chosen[0]) { Add-LogLine 'Leftovers kept. Nothing was deleted.'; Start-Load; return }
     $msg = "Delete $($chosen.Count) item(s) PERMANENTLY?`nThere is no backup and no undo.`n`n" + (($chosen | Select-Object -First 8 | ForEach-Object { "- $($_.Display)" }) -join "`n")
     if ($chosen.Count -gt 8) { $msg += "`n... and $($chosen.Count - 8) more" }
